@@ -8,6 +8,24 @@ Designed for high-volume campus or community channels (8,000+ members), this arc
 
 ---
 
+## ⚡ Why `kopi-maker` Is Different
+
+Most open-source Telegram confession bots on GitHub are single-file Python/Node scripts hosted on free containers that sleep, cold-start, or run out of credits—or pure Google Apps Script setups that choke on large media uploads and hit execution timeouts.
+
+`kopi-maker` is engineered around **edge-serverless quota optimization and real moderation UX**:
+
+| Capability | Typical Hobby Confession Bot | `kopi-maker` Serverless Suite |
+| :--- | :--- | :--- |
+| **Hosting & Uptime** | Paid VPS or free containers that sleep and cold-start | **Cloudflare Workers + KV (\$0/mo, always-on global edge)** |
+| **KV Quota Engineering** | Naive writes burn through free-tier limits rapidly | **4–5 KV writes per post (~200–250+ daily posts on free tier)** |
+| **Media & Albums** | Text-only or single photo; fails on multi-file uploads | **2–10 item albums, videos, file links & text-only `/summon` fallback** |
+| **Pre-Post Editing** | None—admins must reject or manually repost typos | **Native Telegram text & album photo editing synced before publish** |
+| **Long Text & Floods** | Crashes on Telegram's 1,024-char caption limit or hits `429` bans | **Auto-splitting (`...`) + dynamic cooldown spacing** |
+| **Support & OpSec** | Exposes admin accounts or custom domains in SSL logs | **`*.workers.dev` isolation + group-gated support relay** |
+| **Dropped Webhooks** | Entry is lost permanently if a webhook hiccups | **`/summon <id>` instant recovery from Google Sheets backup** |
+
+---
+
 ## 🏗️ System Architecture
 
 ```mermaid
@@ -21,7 +39,7 @@ flowchart TD
 
     ConfessBot <-->|Profanity Filter| Firebase[(Firebase RTDB)]
     ConfessBot <-->|/summon Recovery| Sheets
-    ConfessBot -->|Sends Preview| Preview[Private Staff Preview Room]
+    ConfessBot -->|Sends Preview| Preview[Private Staff Preview Channel]
 
     Preview -->|Admin Approves / Edits| ConfessBot
     ConfessBot -->|Publishes #N| Channel[Main Public Channel]
@@ -40,7 +58,7 @@ flowchart TD
 * **Operational Anonymity (`*.workers.dev`):** Runs entirely on Cloudflare's shared `*.workers.dev` subdomain so administrators never expose personal domains in public Certificate Transparency (SSL) logs.
 * **Rich Media & Album Handling:** Supports plain text, single photos/videos, **2–10 item media albums**, and automatic fallback attachment links for non-media files.
 * **Smart Text & Caption Splitting:** Automatically splits captions exceeding Telegram's 1,024-character limit into separate media + text replies, and chunks texts exceeding 3,800 characters with `...` continuation markers.
-* **Live Native Edit Sync:** Moderators can directly edit text chunks, captions, or swap photos/videos inside the private Telegram preview room before publishing—changes sync automatically when **Submit / Post** is clicked.
+* **Live Native Edit Sync:** Moderators can directly edit text chunks, captions, or swap photos/videos inside the private Telegram preview channel before publishing—changes sync automatically when **Submit / Post** is clicked.
 * **UTF-8 Surrogate Sanitization:** Strips broken half-emojis (unpaired UTF-16 surrogates) that would otherwise trigger Telegram `400 Bad Request` API rejections.
 * **Dynamic Anti-`429` Rate Limiting:** Calculates adaptive cooldown windows based on album size and chunk count to prevent Telegram flood-wait errors during rapid posting.
 * **Dynamic Profanity Filter:** Fetches and caches banned words/phrases from Firebase Realtime Database, manageable live via `/swear add` and `/swear remove`.
@@ -60,7 +78,7 @@ kopi-maker/
 ├── README.md                     # Architecture overview & documentation index
 ├── LICENSE                       # MIT License
 ├── .gitignore                    # Secret & environment exclusions
-├── swearwords.example.json       # Sample profanity JSON for Firebase RTDB import
+├── swearwords.example.json       # Sample profanity array for Firebase RTDB import
 ├── confession-bot/
 │   ├── GUIDE.md                  # Complete setup manual for the Confession Publisher Bot
 │   ├── worker.js                 # Cloudflare Worker backend (Confession Publisher)
@@ -76,9 +94,9 @@ kopi-maker/
 
 Both components are completely independent and must be deployed as **two separate Cloudflare Workers** with **two separate Telegram bot tokens**:
 
-1. **[Confession Publisher Bot — Complete Setup Guide (`confession-bot/GUIDE.md`)](./confession-bot/GUIDE.md)**
+1. **[Confession Publisher Bot — Complete Setup Guide](./confession-bot/GUIDE.md)**
    * Covers Telegram bot creation, Firebase Realtime Database & security rules, Cloudflare Worker + KV deployment, Tally webhook integration, and Google Apps Script `/summon` setup.
-2. **[Enquiries & Support Bot — Complete Setup Guide (`enquiries-bot/GUIDE.md`)](./enquiries-bot/GUIDE.md)**
+2. **[Enquiries & Support Bot — Complete Setup Guide](./enquiries-bot/GUIDE.md)**
    * Covers Telegram support bot creation, discussion group membership gating, Cloudflare Worker + KV deployment, and anonymous two-way ticket routing.
 
 ---
@@ -87,3 +105,7 @@ Both components are completely independent and must be deployed as **two separat
 
 * **Provided "As-Is":** This codebase is released under the MIT License strictly for educational and community self-hosting purposes.
 * **No Free Tech Support:** Please read the step-by-step guides thoroughly. Every configuration flag, permission requirement, and edge case is documented inside `confession-bot/GUIDE.md` and `enquiries-bot/GUIDE.md`.
+
+---
+
+*☕ Brewed late at night with zero budget and too much caffeine.*
