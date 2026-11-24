@@ -11,7 +11,7 @@ const SUPPORT_BOT_USERNAME = "@helpkopi_bot";
 // =========================================================================
 const MAX_CAPTION_LEN = 1000;
 const MAX_TEXT_LEN = 4000;
-const CACHE_TTL = 129600; // 24 hours auto-expiry in KV
+const CACHE_TTL = 129600; // 36 hours auto-expiry in KV
 const SWEAR_CACHE_TTL = 21600; // 6 hours in KV
 
 export default {
@@ -136,10 +136,15 @@ function sanitizeUtf8(str) {
   );
 }
 
+// Supports both "123456789,987654321" and "Boss:123456789,Tauke:987654321"
 function getAdminIds(env) {
   return (env.ADMIN_USER_IDS || "")
     .split(",")
-    .map((id) => id.trim())
+    .map((entry) => {
+      const trimmed = entry.trim();
+      const colonIdx = trimmed.lastIndexOf(":");
+      return colonIdx !== -1 ? trimmed.slice(colonIdx + 1).trim() : trimmed;
+    })
     .filter(Boolean);
 }
 
@@ -1139,7 +1144,7 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
-      await env.MEJAKOPI_KV.put("GLOBAL_SUBMIT_LOCK", "1", { expirationTtl: 30 });
+      await env.MEJAKOPI_KV.put("GLOBAL_SUBMIT_LOCK", "1", { expirationTtl: 60 });
       await env.MEJAKOPI_KV.put(`POSTED_${messageId}`, "1", { expirationTtl: CACHE_TTL });
 
       const existingFileRows = [];
@@ -1498,7 +1503,7 @@ async function restoreSubmitButton(env, chatId, messageId, existingFileRows, cal
     reply_markup: {
       inline_keyboard: [
         ...existingFileRows,
-        [{ text: "📤  Submit / Post", callback_data: callbackData }]
+        [{ text: "📤 Submit / Post", callback_data: callbackData }]
       ]
     }
   });
