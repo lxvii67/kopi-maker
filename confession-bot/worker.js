@@ -4,28 +4,30 @@
 const MESSAGE_FORMAT = "#{number} {confession}";
 const TALLY_CONFESSION_LABEL = "say what you want to say";
 const TALLY_MEDIA_LABEL = "got any pics or vids";
-const SUPPORT_BOT_USERNAME = "@your_support_bot";
+const SUPPORT_BOT_USERNAME = "@helpkopi_bot";
 
 // =========================================================================
 // INTERNAL LIMITS & CACHE DURATIONS
 // =========================================================================
 const MAX_CAPTION_LEN = 1000;
 const MAX_TEXT_LEN = 4000;
-const CACHE_TTL = 86400; // 24 hours auto-expiry in KV
+const CACHE_TTL = 129600; // 24 hours auto-expiry in KV
 const SWEAR_CACHE_TTL = 21600; // 6 hours in KV
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Setup Endpoint: Register Telegram Webhook
+    // 1. Setup Endpoint: Register Telegram Webhook + Secret Token
     if (request.method === "GET" && url.pathname === "/setup") {
       if (url.searchParams.get("key") !== env.WORKER_ADMIN_KEY) {
         return new Response("Unauthorized", { status: 401 });
       }
       const webhookUrl = `${url.origin}/telegram`;
+      const secretToken = await deriveTelegramSecret(env.WORKER_ADMIN_KEY);
       const res = await telegramRequest(env.BOT_TOKEN, "setWebhook", {
         url: webhookUrl,
+        secret_token: secretToken,
         drop_pending_updates: true,
         max_connections: 40,
         allowed_updates: ["callback_query", "edited_channel_post", "channel_post", "message"]
@@ -35,10 +37,22 @@ export default {
       });
     }
 
-    // 2. Tally Form Webhook Endpoint
+    // 2. Tally Form Webhook Endpoint (HMAC-SHA256 Verified)
     if (request.method === "POST" && url.pathname === "/tally") {
       try {
-        const body = await request.json();
+        const rawBody = await request.text();
+        const signatureHeader = request.headers.get("Tally-Signature");
+        const isAuthentic = await verifyTallySignature(
+          rawBody,
+          signatureHeader,
+          env.TALLY_SIGNING_SECRET
+        );
+
+        if (!isAuthentic) {
+          return new Response("Unauthorized: Invalid Tally Signature", { status: 401 });
+        }
+
+        const body = JSON.parse(rawBody);
         ctx.waitUntil(handleTallyWebhook(body, env));
         return new Response("OK", { status: 200 });
       } catch (err) {
@@ -47,9 +61,15 @@ export default {
       }
     }
 
-    // 3. Telegram Bot Webhook Endpoint
+    // 3. Telegram Bot Webhook Endpoint (Secret Token Verified)
     if (request.method === "POST" && url.pathname === "/telegram") {
       try {
+        const expectedSecret = await deriveTelegramSecret(env.WORKER_ADMIN_KEY);
+        const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+        if (incomingSecret !== expectedSecret) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+
         const update = await request.json();
         ctx.waitUntil(handleTelegramUpdate(update, env));
         return new Response("OK", { status: 200 });
@@ -64,9 +84,35 @@ export default {
 };
 
 // =========================================================================
-// FORMATTING, SANITIZATION & TELEGRAM API HELPERS
+// SECURITY, FORMATTING & TELEGRAM API HELPERS
 // =========================================================================
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function deriveTelegramSecret(adminKey) {
+  const data = new TextEncoder().encode(`tg-webhook:${adminKey || ""}`);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .slice(0, 16)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function verifyTallySignature(rawBody, signatureHeader, secret) {
+  if (!secret) return true;
+  if (!signatureHeader) return false;
+
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signatureBuffer = await crypto.subtle.sign("HMAC", key, encoder.encode(rawBody));
+  const expectedBase64 = btoa(String.fromCharCode(...new Uint8Array(signatureBuffer)));
+  return signatureHeader.trim() === expectedBase64;
+}
 
 function formatConfession(number, cleanText) {
   if (!cleanText) {
@@ -249,7 +295,7 @@ function censorSwearWords(text, bannedWords) {
     for (const word of sortedWords) {
       const cleanWord = String(word).trim();
       if (!cleanWord) continue;
-      const escapedWord = cleanWord.replace(/[.*+?^\${}()|[\]\\]/g, "\\\$&");
+      const escapedWord = cleanWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const regex = new RegExp(`(^|[\\s.,!?;:])(${escapedWord})(?=[\\s.,!?;:]|$)`, "gi");
 
       filtered = filtered.replace(regex, (fullMatch, prefix, target) => {
@@ -305,7 +351,7 @@ function stripCodeBlockWrapper(text) {
   const raw = text.trim();
   const codeBlockMatch = raw.match(/```(?:[a-zA-Z0-9_-]*\r?\n)?([\s\S]*?)```/);
   if (codeBlockMatch && codeBlockMatch[1] !== undefined) {
-    return codeBlockMatch[1].replace(/^\r?\n/, "").replace(/\r?\n\$/, "").trim();
+    return codeBlockMatch[1].replace(/^\r?\n/, "").replace(/\r?\n$/, "").trim();
   }
   return raw;
 }
@@ -316,12 +362,11 @@ function detectUrlCategory(url, mimeType = "") {
   if (lowerMime.startsWith("video/")) return "video";
 
   const lowerUrl = url.toLowerCase().split("?")[0];
-  if (lowerUrl.match(/\.(jpg|jpeg|png|webp|bmp|heic|heif|gif)\$/)) return "photo";
-  if (lowerUrl.match(/\.(mp4|mov|avi|webm|mkv|m4v)\$/)) return "video";
+  if (lowerUrl.match(/\.(jpg|jpeg|png|webp|bmp|heic|heif|gif)$/)) return "photo";
+  if (lowerUrl.match(/\.(mp4|mov|avi|webm|mkv|m4v)$/)) return "video";
   return "file";
 }
 
-// Writes at most ONE consolidated META_<finalMsgId> key only when needed
 async function sendLongTextSequence(
   env,
   chatId,
@@ -516,7 +561,7 @@ async function sendPreviewToAdmin(env, chatId, mediaEntries, messageText) {
         fileUrls.length === 1 ? "📎 File Attachment (Admin Only)" : `📎 File #${idx + 1} (Admin Only)`;
       keyboard.push([{ text: label, url: fUrl }]);
     });
-    keyboard.push([{ text: "✅ Submit / Post", callback_data: submitCallbackData }]);
+    keyboard.push([{ text: "📤 Submit / Post", callback_data: submitCallbackData }]);
     return { inline_keyboard: keyboard };
   };
 
@@ -804,11 +849,28 @@ async function handleTelegramUpdate(update, env) {
       const parts = text.split(/\s+/);
       const action = parts[1] ? parts[1].toLowerCase() : "";
 
+      if (action === "list") {
+        const words = await getActiveSwearWords(env);
+        if (words.length === 0) {
+          await telegramRequest(env.BOT_TOKEN, "sendMessage", {
+            chat_id: chatId,
+            text: "📭 The profanity filter list is currently empty."
+          });
+          return;
+        }
+        const formattedList =
+          `🚫 **Active Filter List (${words.length} entries):**\n\n` +
+          words.map((w, idx) => `${idx + 1}. \`${w}\``).join("\n");
+        await sendLongTextSequence(env, chatId, formattedList, null, null, null, "Markdown", false);
+        return;
+      }
+
       if (action !== "add" && action !== "remove") {
         await telegramRequest(env.BOT_TOKEN, "sendMessage", {
           chat_id: chatId,
           text:
             "📖 **How to use /swear:**\n" +
+            "• `/swear list`\n" +
             "• `/swear add word or phrase with spaces`\n" +
             "• `/swear remove word or phrase with spaces`\n\n" +
             "*(Example: `/swear add bad phrase` — no quotes needed!)*",
@@ -968,7 +1030,7 @@ async function handleTelegramUpdate(update, env) {
               const label = savedFiles.length === 1 ? "📎 File Attachment" : `📎 File #${idx + 1}`;
               restoredButtons.push([{ text: label, url: fUrl }]);
             });
-            restoredButtons.push([{ text: "✅ Submit / Post", callback_data: savedCallback }]);
+            restoredButtons.push([{ text: "📤 Submit / Post", callback_data: savedCallback }]);
 
             await telegramRequest(env.BOT_TOKEN, "editMessageReplyMarkup", {
               chat_id: env.PREVIEW_GROUP_ID,
@@ -988,7 +1050,7 @@ async function handleTelegramUpdate(update, env) {
         chat_id: env.PREVIEW_GROUP_ID,
         message_id: msgId,
         reply_markup: {
-          inline_keyboard: [[{ text: "✅ Submit / Post", callback_data: "submit_post" }]]
+          inline_keyboard: [[{ text: "📤 Submit / Post", callback_data: "submit_post" }]]
         }
       });
     }
@@ -1056,6 +1118,17 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
+      // Guard against concurrent submissions across different posts
+      const globalBusy = await env.MEJAKOPI_KV.get("GLOBAL_SUBMIT_LOCK");
+      if (globalBusy) {
+        await telegramRequest(env.BOT_TOKEN, "answerCallbackQuery", {
+          callback_query_id: cb.id,
+          text: "⏳ Another post is currently publishing. Tap Submit again in a few seconds!",
+          show_alert: true
+        });
+        return;
+      }
+
       const alreadyLocked = await env.MEJAKOPI_KV.get(`POSTED_${messageId}`);
       if (alreadyLocked) {
         await telegramRequest(env.BOT_TOKEN, "answerCallbackQuery", {
@@ -1066,6 +1139,7 @@ async function handleTelegramUpdate(update, env) {
         return;
       }
 
+      await env.MEJAKOPI_KV.put("GLOBAL_SUBMIT_LOCK", "1", { expirationTtl: 30 });
       await env.MEJAKOPI_KV.put(`POSTED_${messageId}`, "1", { expirationTtl: CACHE_TTL });
 
       const existingFileRows = [];
@@ -1076,70 +1150,70 @@ async function handleTelegramUpdate(update, env) {
         }
       }
 
-      const now = Date.now();
-      const cooldownUntil = parseInt(
-        (await env.MEJAKOPI_KV.get("CHANNEL_COOLDOWN_UNTIL")) || "0",
-        10
-      );
-      const waitMs = cooldownUntil - now;
-      let reservedCooldownUntil = now + 4000;
-
-      if (waitMs > 0) {
-        const waitSec = Math.ceil(waitMs / 1000);
-        reservedCooldownUntil = cooldownUntil + 3500;
-        await env.MEJAKOPI_KV.put("CHANNEL_COOLDOWN_UNTIL", String(reservedCooldownUntil), {
-          expirationTtl: 60
-        });
-
-        await telegramRequest(env.BOT_TOKEN, "answerCallbackQuery", {
-          callback_query_id: cb.id,
-          text: `⏳ Cooling down (${waitSec}s) to avoid Telegram rate limit...`
-        });
-
-        await telegramRequest(env.BOT_TOKEN, "editMessageReplyMarkup", {
-          chat_id: chatId,
-          message_id: messageId,
-          reply_markup: {
-            inline_keyboard: [
-              ...existingFileRows,
-              [{ text: `⏳ Cooldown (${waitSec}s)...`, callback_data: "already_posted" }]
-            ]
-          }
-        });
-
-        await sleep(waitMs);
-      } else {
-        await env.MEJAKOPI_KV.put("CHANNEL_COOLDOWN_UNTIL", String(reservedCooldownUntil), {
-          expirationTtl: 60
-        });
-
-        await telegramRequest(env.BOT_TOKEN, "answerCallbackQuery", {
-          callback_query_id: cb.id,
-          text: "🚀 Posting..."
-        });
-
-        await telegramRequest(env.BOT_TOKEN, "editMessageReplyMarkup", {
-          chat_id: chatId,
-          message_id: messageId,
-          reply_markup: {
-            inline_keyboard: [
-              ...existingFileRows,
-              [{ text: "⏳ Posting...", callback_data: "already_posted" }]
-            ]
-          }
-        });
-      }
-
-      let currentCount = parseInt((await env.MEJAKOPI_KV.get("POST_COUNTER")) || "0", 10);
-      currentCount++;
-
-      let postResponse = null;
-      let firstPostMsg = null;
-      let postedMediaCount = 0;
-      let postedTextLen = 0;
-      let postedChunkCount = 1;
-
       try {
+        const now = Date.now();
+        const cooldownUntil = parseInt(
+          (await env.MEJAKOPI_KV.get("CHANNEL_COOLDOWN_UNTIL")) || "0",
+          10
+        );
+        const waitMs = cooldownUntil - now;
+        let reservedCooldownUntil = now + 4000;
+
+        if (waitMs > 0) {
+          const waitSec = Math.ceil(waitMs / 1000);
+          reservedCooldownUntil = cooldownUntil + 3500;
+          await env.MEJAKOPI_KV.put("CHANNEL_COOLDOWN_UNTIL", String(reservedCooldownUntil), {
+            expirationTtl: 60
+          });
+
+          await telegramRequest(env.BOT_TOKEN, "answerCallbackQuery", {
+            callback_query_id: cb.id,
+            text: `⏳ Cooling down (${waitSec}s) to avoid Telegram rate limit...`
+          });
+
+          await telegramRequest(env.BOT_TOKEN, "editMessageReplyMarkup", {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [
+                ...existingFileRows,
+                [{ text: `⏳ Cooldown (${waitSec}s)...`, callback_data: "already_posted" }]
+              ]
+            }
+          });
+
+          await sleep(waitMs);
+        } else {
+          await env.MEJAKOPI_KV.put("CHANNEL_COOLDOWN_UNTIL", String(reservedCooldownUntil), {
+            expirationTtl: 60
+          });
+
+          await telegramRequest(env.BOT_TOKEN, "answerCallbackQuery", {
+            callback_query_id: cb.id,
+            text: "🚀 Posting..."
+          });
+
+          await telegramRequest(env.BOT_TOKEN, "editMessageReplyMarkup", {
+            chat_id: chatId,
+            message_id: messageId,
+            reply_markup: {
+              inline_keyboard: [
+                ...existingFileRows,
+                [{ text: "⏳ Posting...", callback_data: "already_posted" }]
+              ]
+            }
+          });
+        }
+
+        let currentCount = parseInt((await env.MEJAKOPI_KV.get("POST_COUNTER")) || "0", 10);
+        currentCount++;
+
+        let postResponse = null;
+        let firstPostMsg = null;
+        let postedMediaCount = 0;
+        let postedTextLen = 0;
+        let postedChunkCount = 1;
+
         // Sub-case 1: Album
         if (data.startsWith("submit_album_")) {
           const firstAlbumMsgId = data.replace("submit_album_", "");
@@ -1410,6 +1484,8 @@ async function handleTelegramUpdate(update, env) {
           parse_mode: "Markdown",
           reply_to_message_id: messageId
         });
+      } finally {
+        await env.MEJAKOPI_KV.delete("GLOBAL_SUBMIT_LOCK");
       }
     }
   }
@@ -1422,7 +1498,7 @@ async function restoreSubmitButton(env, chatId, messageId, existingFileRows, cal
     reply_markup: {
       inline_keyboard: [
         ...existingFileRows,
-        [{ text: "✅ Submit / Post", callback_data: callbackData }]
+        [{ text: "📤  Submit / Post", callback_data: callbackData }]
       ]
     }
   });

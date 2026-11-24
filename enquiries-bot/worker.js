@@ -1,22 +1,24 @@
 // =========================================================================
-// ENQUIRIES & SUPPORT RELAY WORKER (Cloudflare Workers + KV)
+// ENQUIRIES & DIRECT CHAT RELAY WORKER (Cloudflare Workers + KV)
 // =========================================================================
 const TICKET_TTL = 2592000; // 30 days in KV
 const MEMBER_CACHE_TTL = 900; // 15 minutes in KV
-const USER_COOLDOWN_SEC = 5; // Anti-flood delay between user messages
+const USER_COOLDOWN_SEC = 3; // Anti-flood delay between user messages
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Setup Endpoint: Register Telegram Webhook
+    // 1. Setup Endpoint: Register Telegram Webhook + Secret Token
     if (request.method === "GET" && url.pathname === "/setup") {
       if (url.searchParams.get("key") !== env.WORKER_ADMIN_KEY) {
         return new Response("Unauthorized", { status: 401 });
       }
       const webhookUrl = `${url.origin}/telegram`;
+      const secretToken = await deriveTelegramSecret(env.WORKER_ADMIN_KEY);
       const res = await telegramRequest(env.BOT_TOKEN, "setWebhook", {
         url: webhookUrl,
+        secret_token: secretToken,
         drop_pending_updates: true,
         max_connections: 40,
         allowed_updates: ["message"]
@@ -26,9 +28,15 @@ export default {
       });
     }
 
-    // 2. Telegram Bot Webhook Endpoint
+    // 2. Telegram Bot Webhook Endpoint (Secret Token Verified)
     if (request.method === "POST" && url.pathname === "/telegram") {
       try {
+        const expectedSecret = await deriveTelegramSecret(env.WORKER_ADMIN_KEY);
+        const incomingSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+        if (incomingSecret !== expectedSecret) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+
         const update = await request.json();
         ctx.waitUntil(handleTelegramUpdate(update, env));
         return new Response("OK", { status: 200 });
@@ -38,24 +46,51 @@ export default {
       }
     }
 
-    return new Response("Enquiries & Support Relay Worker Active", { status: 200 });
+    return new Response("Enquiries Relay Worker Active", { status: 200 });
   }
 };
 
 // =========================================================================
-// TELEGRAM API & HELPERS
+// SECURITY, ADMIN PARSING & TELEGRAM API HELPERS
 // =========================================================================
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-function getAdminIds(env) {
-  return (env.ADMIN_USER_IDS || "")
+async function deriveTelegramSecret(adminKey) {
+  const data = new TextEncoder().encode(`tg-webhook:${adminKey || ""}`);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .slice(0, 16)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+// Supports both "Boss:123456789,Tauke:987654321" and "123456789,987654321"
+function parseAdmins(env) {
+  const adminMap = new Map();
+  const entries = (env.ADMIN_USER_IDS || "")
     .split(",")
-    .map((id) => id.trim())
+    .map((item) => item.trim())
     .filter(Boolean);
+
+  for (const entry of entries) {
+    const colonIdx = entry.lastIndexOf(":");
+    if (colonIdx !== -1) {
+      const label = entry.slice(0, colonIdx).trim();
+      const id = entry.slice(colonIdx + 1).trim();
+      if (id) adminMap.set(id, label || null);
+    } else {
+      adminMap.set(entry, null);
+    }
+  }
+  return adminMap;
+}
+
+function isShowAdminNameEnabled(env) {
+  return String(env.SHOW_ADMIN_NAME || "false").trim().toLowerCase() === "true";
 }
 
 async function telegramRequest(botToken, method, payload, retries = 2) {
-  const apiUrl = `[https://api.telegram.org/bot$](https://api.telegram.org/bot$){botToken}/${method}`;
+  const apiUrl = `https://api.telegram.org/bot${botToken}/${method}`;
   for (let attempt = 0; attempt <= retries; attempt++) {
     const res = await fetch(apiUrl, {
       method: "POST",
@@ -74,7 +109,6 @@ async function telegramRequest(botToken, method, payload, retries = 2) {
 }
 
 async function isCommunityMember(env, userId) {
-  // If COMMUNITY_GROUP_ID is blank, membership gate is disabled
   if (!env.COMMUNITY_GROUP_ID) return true;
 
   const cacheKey = `MEMBER_${userId}`;
@@ -101,6 +135,56 @@ async function isCommunityMember(env, userId) {
   return isValid;
 }
 
+async function relayStaffReply(env, targetUserId, msg, adminLabel) {
+  const showName = isShowAdminNameEnabled(env) && Boolean(adminLabel);
+
+  if (!showName) {
+    return telegramRequest(env.BOT_TOKEN, "copyMessage", {
+      chat_id: targetUserId,
+      from_chat_id: env.STAFF_GROUP_ID,
+      message_id: msg.message_id
+    });
+  }
+
+  // Text reply with "Label: message" prefix
+  if (msg.text) {
+    return telegramRequest(env.BOT_TOKEN, "sendMessage", {
+      chat_id: targetUserId,
+      text: `${adminLabel}: ${msg.text}`
+    });
+  }
+
+  // Media types that support caption replacement in copyMessage
+  const supportsCaption = Boolean(
+    msg.photo || msg.video || msg.document || msg.animation || msg.audio
+  );
+
+  if (supportsCaption) {
+    const prefixedCaption = msg.caption
+      ? `${adminLabel}: ${msg.caption}`
+      : `${adminLabel}:`;
+
+    return telegramRequest(env.BOT_TOKEN, "copyMessage", {
+      chat_id: targetUserId,
+      from_chat_id: env.STAFF_GROUP_ID,
+      message_id: msg.message_id,
+      caption: prefixedCaption
+    });
+  }
+
+  // Stickers, voice notes, or video notes: send label header then copy message
+  await telegramRequest(env.BOT_TOKEN, "sendMessage", {
+    chat_id: targetUserId,
+    text: `${adminLabel}:`
+  });
+
+  return telegramRequest(env.BOT_TOKEN, "copyMessage", {
+    chat_id: targetUserId,
+    from_chat_id: env.STAFF_GROUP_ID,
+    message_id: msg.message_id
+  });
+}
+
 // =========================================================================
 // MAIN UPDATE ROUTER
 // =========================================================================
@@ -113,7 +197,7 @@ async function handleTelegramUpdate(update, env) {
   const channelHandle = env.CHANNEL_HANDLE || "our main channel";
 
   // -----------------------------------------------------------------------
-  // BRANCH A: USER DIRECT MESSAGE -> PRIVATE STAFF TICKET ROOM
+  // BRANCH A: USER DIRECT MESSAGE -> SILENT FORWARD TO STAFF ROOM
   // -----------------------------------------------------------------------
   if (msg.chat.type === "private") {
     const text = (msg.text || "").trim();
@@ -157,18 +241,17 @@ async function handleTelegramUpdate(update, env) {
         chat_id: userId,
         text:
           `⛔ **Access Restricted**\n\n` +
-          `You must be an active member of the **${channelHandle}** community discussion group before messaging support.`,
+          `You must be an active member of the **${channelHandle}** community discussion group before messaging here.`,
         parse_mode: "Markdown"
       });
       return;
     }
 
-    // Set short anti-flood cooldown
     await env.SUPPORT_KV.put(`CD_${userId}`, String(now + USER_COOLDOWN_SEC * 1000), {
       expirationTtl: 60
     });
 
-    // 4. Native Forward to Staff Ticket Room (preserves user's Forward Privacy settings)
+    // 4. Native Forward to Staff Room (Completely silent on user's end)
     const fwdRes = await telegramRequest(env.BOT_TOKEN, "forwardMessage", {
       chat_id: env.STAFF_GROUP_ID,
       from_chat_id: userId,
@@ -176,6 +259,7 @@ async function handleTelegramUpdate(update, env) {
     });
 
     if (!fwdRes || !fwdRes.ok || !fwdRes.result) {
+      console.error("forwardMessage failed:", JSON.stringify(fwdRes));
       await telegramRequest(env.BOT_TOKEN, "sendMessage", {
         chat_id: userId,
         text: "❌ Unable to deliver your message right now. Please try again later."
@@ -192,52 +276,25 @@ async function handleTelegramUpdate(update, env) {
     await env.SUPPORT_KV.put(`TICKET_${forwardedMsgId}`, ticketData, {
       expirationTtl: TICKET_TTL
     });
-
-    // 5. Post Compact Ticket Control Banner in Staff Room
-    const privacyLabel = fwdRes.result.forward_from
-      ? "👤 Forward Privacy: Visible"
-      : "🔒 Forward Privacy: Hidden";
-
-    const bannerRes = await telegramRequest(env.BOT_TOKEN, "sendMessage", {
-      chat_id: env.STAFF_GROUP_ID,
-      text:
-        `🎫 **New Support Ticket** (${privacyLabel})\n` +
-        `*Reply directly to the user's message or this banner to respond.*\n` +
-        `Commands: \`/ban\` • \`/unban\` • \`/status\``,
-      parse_mode: "Markdown",
-      reply_to_message_id: forwardedMsgId
-    });
-
-    if (bannerRes && bannerRes.ok && bannerRes.result) {
-      await env.SUPPORT_KV.put(`TICKET_${bannerRes.result.message_id}`, ticketData, {
-        expirationTtl: TICKET_TTL
-      });
-    }
-
-    await telegramRequest(env.BOT_TOKEN, "sendMessage", {
-      chat_id: userId,
-      text: "✅ Your message has been forwarded to the moderation team. Please wait patiently for a reply."
-    });
     return;
   }
 
   // -----------------------------------------------------------------------
-  // BRANCH B: STAFF TICKET ROOM -> ANONYMOUS REPLY OR MODERATION COMMAND
+  // BRANCH B: STAFF ROOM -> DIRECT REPLY OR MODERATION COMMAND
   // -----------------------------------------------------------------------
   if (chatId === String(env.STAFF_GROUP_ID)) {
-    // Ignore normal staff chat messages that are not replies to a ticket
     if (!msg.reply_to_message) return;
 
     const repliedMsgId = msg.reply_to_message.message_id;
     const rawTicket = await env.SUPPORT_KV.get(`TICKET_${repliedMsgId}`);
     const text = (msg.text || "").trim();
-    const adminIds = getAdminIds(env);
+    const adminMap = parseAdmins(env);
 
     if (!rawTicket) {
-      if (text.startsWith("/ban") || text.startsWith("/unban") || text.startsWith("/status")) {
+      if (text.startsWith("/ban") || text.startsWith("/unban") || text.startsWith("/info")) {
         await telegramRequest(env.BOT_TOKEN, "sendMessage", {
           chat_id: env.STAFF_GROUP_ID,
-          text: "⚠️ Ticket expired (older than 30 days) or invalid target message.",
+          text: "⚠️ Conversation expired (older than 30 days) or invalid target message.",
           reply_to_message_id: msg.message_id
         });
       }
@@ -247,9 +304,8 @@ async function handleTelegramUpdate(update, env) {
     const ticket = JSON.parse(rawTicket);
     const targetUserId = ticket.userId;
 
-    // Staff Command: /ban
     if (text === "/ban") {
-      if (!adminIds.includes(userId)) {
+      if (!adminMap.has(userId)) {
         await telegramRequest(env.BOT_TOKEN, "sendMessage", {
           chat_id: env.STAFF_GROUP_ID,
           text: "⛔ Only authorized admins can run `/ban`.",
@@ -261,16 +317,15 @@ async function handleTelegramUpdate(update, env) {
       await env.SUPPORT_KV.put(`BLOCKED_${targetUserId}`, "1");
       await telegramRequest(env.BOT_TOKEN, "sendMessage", {
         chat_id: env.STAFF_GROUP_ID,
-        text: "🚫 User has been **permanently blocked** from messaging support.",
+        text: "🚫 User has been **permanently blocked**.",
         parse_mode: "Markdown",
         reply_to_message_id: msg.message_id
       });
       return;
     }
 
-    // Staff Command: /unban
     if (text === "/unban") {
-      if (!adminIds.includes(userId)) {
+      if (!adminMap.has(userId)) {
         await telegramRequest(env.BOT_TOKEN, "sendMessage", {
           chat_id: env.STAFF_GROUP_ID,
           text: "⛔ Only authorized admins can run `/unban`.",
@@ -282,21 +337,20 @@ async function handleTelegramUpdate(update, env) {
       await env.SUPPORT_KV.delete(`BLOCKED_${targetUserId}`);
       await telegramRequest(env.BOT_TOKEN, "sendMessage", {
         chat_id: env.STAFF_GROUP_ID,
-        text: "✅ User has been **unblocked** and may submit inquiries again.",
+        text: "✅ User has been **unblocked**.",
         parse_mode: "Markdown",
         reply_to_message_id: msg.message_id
       });
       return;
     }
 
-    // Staff Command: /status
-    if (text === "/status") {
+    if (text === "/info") {
       const isBanned = Boolean(await env.SUPPORT_KV.get(`BLOCKED_${targetUserId}`));
       await telegramRequest(env.BOT_TOKEN, "sendMessage", {
         chat_id: env.STAFF_GROUP_ID,
         text:
-          `📋 **Ticket Status**\n` +
-          `• **Opened:** \`${ticket.createdAt}\`\n` +
+          `📋 **User Info**\n` +
+          `• **Message Sent:** \`${ticket.createdAt}\`\n` +
           `• **Account State:** ${isBanned ? "🚫 Banned" : "🟢 Active"}`,
         parse_mode: "Markdown",
         reply_to_message_id: msg.message_id
@@ -304,28 +358,11 @@ async function handleTelegramUpdate(update, env) {
       return;
     }
 
-    // Relay Staff Reply (supports text, photos, videos, documents, stickers, voice, etc.)
-    const copyRes = await telegramRequest(env.BOT_TOKEN, "copyMessage", {
-      chat_id: targetUserId,
-      from_chat_id: env.STAFF_GROUP_ID,
-      message_id: msg.message_id
-    });
+    const adminLabel = adminMap.get(userId) || null;
+    const relayRes = await relayStaffReply(env, targetUserId, msg, adminLabel);
 
-    if (copyRes && copyRes.ok) {
-      const reactRes = await telegramRequest(env.BOT_TOKEN, "setMessageReaction", {
-        chat_id: env.STAFF_GROUP_ID,
-        message_id: msg.message_id,
-        reaction: [{ type: "emoji", emoji: "👍" }]
-      });
-      if (!reactRes || !reactRes.ok) {
-        await telegramRequest(env.BOT_TOKEN, "sendMessage", {
-          chat_id: env.STAFF_GROUP_ID,
-          text: "✅ Reply delivered.",
-          reply_to_message_id: msg.message_id
-        });
-      }
-    } else {
-      const errReason = copyRes?.description || "User may have blocked the bot";
+    if (!relayRes || !relayRes.ok) {
+      const errReason = relayRes?.description || "User may have blocked the bot";
       await telegramRequest(env.BOT_TOKEN, "sendMessage", {
         chat_id: env.STAFF_GROUP_ID,
         text: `❌ Failed to deliver reply: \`${errReason}\``,
