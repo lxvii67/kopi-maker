@@ -301,7 +301,7 @@ function censorSwearWords(text, bannedWords) {
       const cleanWord = String(word).trim();
       if (!cleanWord) continue;
       const escapedWord = cleanWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const regex = new RegExp(`(^|[\\s.,!?;:])(${escapedWord})(?=[\\s.,!?;:]|$)`, "gi");
+      const regex = new RegExp(`(^|[\\s.,!?;:()\\[\\]{}"'/-])(${escapedWord})(?=[\\s.,!?;:()\\[\\]{}"'/-]|$)`, "gi");
 
       filtered = filtered.replace(regex, (fullMatch, prefix, target) => {
         const censored = target.replace(/\S+/g, (w) => {
